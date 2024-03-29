@@ -18,6 +18,9 @@
 use core::convert::From;
 use core::marker::PhantomData;
 
+#[cfg(feature = "tracing")]
+use crate::tracing;
+
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub struct RW;
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -190,6 +193,11 @@ where
     pub const fn ptr(&self) -> *mut T::DataType {
         self.ptr as _
     }
+
+    /// Returns the address of the register.
+    pub fn addr(&self) -> usize {
+        self.ptr as usize
+    }
 }
 impl<T, A> Reg<T, A>
 where
@@ -205,6 +213,15 @@ where
     #[inline(always)]
     #[must_use]
     pub unsafe fn read(&self) -> RegValueT<T> {
+        #[cfg(feature = "tracing")]
+        let val = {
+            let mut buf: u64 = 0x0;
+            tracing::READ_FN.with(|rf| {
+                buf = rf.get().unwrap()(self.addr(), std::mem::size_of::<T::DataType>());
+            });
+            T::DataType::cast_from(buf)
+        };
+        #[cfg(not(feature = "tracing"))]
         let val = (self.ptr as *mut T::DataType).read_volatile();
         RegValueT::<T>::new(val)
     }
@@ -227,6 +244,15 @@ where
     ///
     #[inline(always)]
     pub unsafe fn write(&self, reg_value: RegValueT<T>) {
+        #[cfg(feature = "tracing")]
+        tracing::WRITE_FN.with(|wf| {
+            wf.get().unwrap()(
+                self.addr(),
+                std::mem::size_of::<T::DataType>(),
+                reg_value.data.into(),
+            )
+        });
+        #[cfg(not(feature = "tracing"))]
         (self.ptr as *mut T::DataType).write_volatile(reg_value.data);
     }
 }
@@ -302,12 +328,19 @@ where
     pub unsafe fn modify_atomic(&self, f: impl FnOnce(RegValueT<T>) -> RegValueT<T>) {
         let val = RegValueT::<T>::default();
         let res = f(val);
+
+        #[cfg(feature = "tracing")]
+        tracing::LDMST.with(|ldmstf| {
+            ldmstf.get().unwrap()(self.addr(), res.data as u64 | ((res.mask as u64) << 32))
+        });
+        #[cfg(not(feature = "tracing"))]
         unsafe {
             core::arch::tricore::intrinsics::__ldmst(self.ptr as *mut u32, res.data, res.mask);
         }
     }
 }
 
+#[cfg(not(feature = "tracing"))]
 use core::arch::tricore::intrinsics::{__mfcr, __mtcr};
 #[cfg(any(target_feature = "tc18", doc))]
 use core::arch::tricore::intrinsics::{__mfdcr, __mtdcr};
@@ -345,7 +378,7 @@ impl<T: RegSpec<DataType = u32>, A: Access, const ADDR: u16> RegCore<T, A, ADDR>
         let val = {
             let mut buf: u64 = 0x0;
             tracing::READ_FN.with(|rf| {
-                buf = rf.get().unwrap()(self.addr(), std::mem::size_of::<T::DataType>());
+                buf = rf.get().unwrap()(ADDR.into(), std::mem::size_of::<T::DataType>());
             });
             T::DataType::cast_from(buf)
         };
@@ -373,9 +406,9 @@ impl<T: RegSpec<DataType = u32>, A: Access, const ADDR: u16> RegCore<T, A, ADDR>
         #[cfg(feature = "tracing")]
         tracing::WRITE_FN.with(|wf| {
             wf.get().unwrap()(
-                self.addr(),
+                ADDR.into(),
                 std::mem::size_of::<T::DataType>(),
-                reg_value.data().into(),
+                reg_value.data.into(),
             )
         });
         #[cfg(not(feature = "tracing"))]
